@@ -5,11 +5,227 @@ import 'dart:math';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
+
+// Define task names
+const kTaskCaptureOnce = "capture.once";
+const kTaskCaptureRandom = "capture.random";
+
+// Global variables for background tasks
+List<CameraDescription>? _cameras;
+CameraController? _backgroundController;
+Random _random = Random();
+
+// This is the main callback that will be called by Workmanager in the background
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    print('Background task executed: $task');
+
+    // Initialize notifications for Foreground Service
+    final FlutterLocalNotificationsPlugin notifications =
+        FlutterLocalNotificationsPlugin();
+    const AndroidInitializationSettings androidSettings =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    const InitializationSettings initSettings =
+        InitializationSettings(android: androidSettings);
+    await notifications.initialize(initSettings);
+
+    // Start a Foreground Service (required for Android 9+)
+    const AndroidNotificationDetails androidDetails =
+        AndroidNotificationDetails(
+      'camera_channel',
+      'Camera Capture',
+      channelDescription: 'Used for background camera capture',
+      importance: Importance.high,
+      priority: Priority.high,
+      ongoing: true, // Required for Foreground Service
+      showWhen: false,
+    );
+    await notifications.show(
+      999,
+      'Capturing photos in background',
+      'Random Camera is running...',
+      const NotificationDetails(android: androidDetails),
+    );
+
+    switch (task) {
+      case kTaskCaptureOnce:
+        // Take a single photo in the background
+        await _backgroundCaptureImage(notifications, inputData);
+        break;
+
+      case kTaskCaptureRandom:
+        // Background capture then schedule next one if session is still active
+        await _backgroundCaptureImage(notifications, inputData);
+
+        // Check if we should continue capturing
+        final prefs = await SharedPreferences.getInstance();
+        final isActive = prefs.getBool('isActive') ?? false;
+        final endTime = prefs.getInt('sessionEndTime') ?? 0;
+
+        if (isActive && DateTime.now().millisecondsSinceEpoch < endTime) {
+          // Schedule next capture
+          final minDelay = prefs.getInt('minDelay') ?? 5;
+          final maxDelay = prefs.getInt('maxDelay') ?? 10;
+          final nextDelay = minDelay + _random.nextInt(maxDelay - minDelay + 1);
+
+          // Schedule next capture
+          await Workmanager().registerOneOffTask(
+            "random_capture_${DateTime.now().millisecondsSinceEpoch}",
+            kTaskCaptureRandom,
+            initialDelay: Duration(seconds: nextDelay),
+            inputData: inputData,
+          );
+
+          // Show notification
+          await _showBackgroundNotification(
+            notifications,
+            'Next Capture Scheduled',
+            'Next photo in $nextDelay seconds',
+          );
+        } else {
+          // Session completed in background
+          await prefs.setBool('isActive', false);
+          await _showBackgroundNotification(
+            notifications,
+            'Capture Session Completed',
+            'Random capture session has ended',
+          );
+        }
+        break;
+
+      default:
+        break;
+    }
+
+    return Future.value(true);
+  });
+}
+
+// Function to capture an image in the background
+Future<void> _backgroundCaptureImage(
+    FlutterLocalNotificationsPlugin notifications,
+    Map<String, dynamic>? inputData) async {
+  const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+    'camera_channel',
+    'Camera Capture',
+    channelDescription: 'Used for background camera capture',
+    importance: Importance.high,
+    priority: Priority.high,
+    ongoing: true, // Required for Foreground Service
+    showWhen: false,
+  );
+  try {
+    // Ensure Flutter binding is initialized (required for background execution)
+    WidgetsFlutterBinding.ensureInitialized();
+
+    // Show a persistent notification (required for Foreground Service)
+
+    await notifications.show(
+      1000,
+      'Capturing photo...',
+      'Random Camera is taking a photo',
+      const NotificationDetails(android: androidDetails),
+    );
+
+    // Initialize camera if not already initialized
+    _cameras ??= await availableCameras();
+
+    if (_cameras != null && _cameras!.isNotEmpty) {
+      // Determine which camera to use (front or back)
+      final prefs = await SharedPreferences.getInstance();
+      final isFrontCamera = prefs.getBool('isFrontCamera') ?? true;
+      int cameraIndex = isFrontCamera ? 1 : 0;
+      if (cameraIndex >= _cameras!.length) {
+        cameraIndex = 0;
+      }
+
+      // Initialize camera controller
+      _backgroundController?.dispose();
+      _backgroundController = CameraController(
+        _cameras![cameraIndex],
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+
+      // Initialize and take picture
+      await _backgroundController!.initialize();
+
+      // Wait a bit for camera to stabilize
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      // Take the picture
+      final XFile image = await _backgroundController!.takePicture();
+
+      // Get the save directory
+      final directory = await getApplicationDocumentsDirectory();
+      final String folder = '${directory.path}/random_captures';
+      await Directory(folder).create(recursive: true);
+
+      // Generate filename
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final String filename = '$folder/capture_$timestamp.jpg';
+
+      // Save image
+      final File savedImage = File(filename);
+      await savedImage.writeAsBytes(await File(image.path).readAsBytes());
+
+      // Update capture count
+      final totalCaptures = (prefs.getInt('totalCaptures') ?? 0) + 1;
+      await prefs.setInt('totalCaptures', totalCaptures);
+
+      // Notify user
+      await notifications.show(
+        1001,
+        'Photo captured!',
+        'New photo saved (Total: $totalCaptures)',
+        const NotificationDetails(android: androidDetails),
+      );
+
+      // Clean up
+      await _backgroundController!.dispose();
+      _backgroundController = null;
+    }
+  } catch (e) {
+    print('Error in background capture: $e');
+    await notifications.show(
+      1002,
+      'Capture failed',
+      'Error: ${e.toString().substring(0, 50)}',
+      const NotificationDetails(android: androidDetails),
+    );
+  }
+}
+
+// Show notification from background
+Future<void> _showBackgroundNotification(
+  FlutterLocalNotificationsPlugin notifications,
+  String title,
+  String message,
+) async {
+  const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+    'random_camera_channel',
+    'Random Camera',
+    channelDescription: 'Random Camera Notifications',
+    importance: Importance.high,
+  );
+
+  const NotificationDetails details =
+      NotificationDetails(android: androidDetails);
+
+  await notifications.show(
+    DateTime.now()
+        .millisecondsSinceEpoch
+        .remainder(100000), // Using timestamp for unique ID
+    title,
+    message,
+    details,
+  );
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,19 +233,12 @@ void main() async {
   // Initialize workmanager for background tasks
   Workmanager().initialize(
     callbackDispatcher,
-    isInDebugMode: false,
+    isInDebugMode: true,
   );
 
-  runApp(const RandomCameraApp());
-}
+  Workmanager().cancelAll();
 
-// Background task callback
-void callbackDispatcher() {
-  Workmanager().executeTask((task, inputData) async {
-    // Take random photo logic will go here for background execution
-    print('Background task executed: $task');
-    return Future.value(true);
-  });
+  runApp(const RandomCameraApp());
 }
 
 class RandomCameraApp extends StatelessWidget {
@@ -68,22 +277,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool isFrontCamera = true;
 
   // Settings
-  int minDelay = 30; // seconds
-  int maxDelay = 300; // seconds
+  int minDelay = 5; // seconds
+  int maxDelay = 10; // seconds
   int duration = 60; // minutes
   bool isActive = false;
 
-  // Face detection
-  final FaceDetector faceDetector = FaceDetector(
-    options: FaceDetectorOptions(
-      enableClassification: true,
-    ),
-  );
-
   // Stats
   int totalCaptures = 0;
-  int lookingCaptures = 0;
-  int notLookingCaptures = 0;
 
   // Timer and random generator
   Timer? captureTimer;
@@ -112,6 +312,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     // Initialize notifications
     await _initializeNotifications();
+
+    // Check if there was an active session
+    await _checkForActiveSession();
+  }
+
+  Future<void> _checkForActiveSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    final wasActive = prefs.getBool('isActive') ?? false;
+    final endTime = prefs.getInt('sessionEndTime') ?? 0;
+
+    // If there was an active session and it hasn't ended
+    if (wasActive && DateTime.now().millisecondsSinceEpoch < endTime) {
+      setState(() {
+        isActive = true;
+      });
+
+      // If app is in foreground, start foreground timer
+      _scheduleNextCapture();
+    } else if (wasActive) {
+      // Clear the active flag if session has ended
+      await prefs.setBool('isActive', false);
+    }
   }
 
   Future<void> _initializeCamera() async {
@@ -126,7 +348,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
         controller = CameraController(
           cameras[cameraIndex],
-          ResolutionPreset.medium,
+          ResolutionPreset.high,
           enableAudio: false,
         );
 
@@ -139,19 +361,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _requestPermissions() async {
-    await Permission.camera.request();
-    await Permission.storage.request();
+    print("requesting permissions");
+
+    await [
+      Permission.camera,
+      Permission.storage,
+      Permission.notification,
+    ].request();
+
+    // Check if permissions are granted
+    if (!(await Permission.camera.isGranted)) {
+      _showMessage("Camera permission not granted.");
+    }
   }
 
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      minDelay = prefs.getInt('minDelay') ?? 30;
-      maxDelay = prefs.getInt('maxDelay') ?? 300;
+      minDelay = prefs.getInt('minDelay') ?? 5;
+      maxDelay = prefs.getInt('maxDelay') ?? 10;
       duration = prefs.getInt('duration') ?? 60;
       totalCaptures = prefs.getInt('totalCaptures') ?? 0;
-      lookingCaptures = prefs.getInt('lookingCaptures') ?? 0;
-      notLookingCaptures = prefs.getInt('notLookingCaptures') ?? 0;
+      isFrontCamera = prefs.getBool('isFrontCamera') ?? true;
     });
   }
 
@@ -161,8 +392,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await prefs.setInt('maxDelay', maxDelay);
     await prefs.setInt('duration', duration);
     await prefs.setInt('totalCaptures', totalCaptures);
-    await prefs.setInt('lookingCaptures', lookingCaptures);
-    await prefs.setInt('notLookingCaptures', notLookingCaptures);
+    await prefs.setBool('isFrontCamera', isFrontCamera);
   }
 
   Future<void> _initializeNotifications() async {
@@ -205,8 +435,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       return;
     }
 
-    if (!(await Permission.camera.isGranted) ||
-        !(await Permission.storage.isGranted)) {
+    if (!(await Permission.camera.isGranted)) {
       _showMessage('Permissions required');
       return;
     }
@@ -215,10 +444,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       isActive = true;
     });
 
+    // Calculate end time and save to preferences
+    final endTimeMillis =
+        DateTime.now().millisecondsSinceEpoch + (duration * 60 * 1000);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('isActive', true);
+    await prefs.setInt('sessionEndTime', endTimeMillis);
     await _saveSettings();
+
     _showNotification('Random Camera', 'Started capturing random photos');
 
+    // Schedule first capture in foreground
     _scheduleNextCapture();
+
+    // Register background task for when app is killed
+    // This ensures at least one capture happens if app is closed
+    final Map<String, dynamic> inputData = {
+      'isFrontCamera': isFrontCamera,
+      'started': DateTime.now().millisecondsSinceEpoch,
+    };
+
+    await Workmanager().registerOneOffTask(
+      "random_capture_first",
+      kTaskCaptureRandom,
+      initialDelay: Duration(seconds: minDelay),
+      inputData: inputData,
+      existingWorkPolicy: ExistingWorkPolicy.replace,
+    );
 
     // Set end timer
     Timer(Duration(minutes: duration), () {
@@ -247,43 +499,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       // Take picture
       final XFile image = await controller!.takePicture();
 
-      // Process image to detect faces
-      final inputImage = InputImage.fromFilePath(image.path);
-      final List<Face> faces = await faceDetector.processImage(inputImage);
-
       // Create directory to save images if not exists
       final directory = await getApplicationDocumentsDirectory();
       final String folder = '${directory.path}/random_captures';
       await Directory(folder).create(recursive: true);
 
-      // Generate filename based on face detection
+      // Generate filename
       final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final bool isLooking = faces.isNotEmpty;
-      final String prefix = isLooking ? 'looking' : 'not_looking';
-      final String filename = '$folder/${prefix}_$timestamp.jpg';
+      final String filename = '$folder/capture_$timestamp.jpg';
 
-      // Save image with new filename
+      // Save image
       final File savedImage = File(filename);
       await savedImage.writeAsBytes(await File(image.path).readAsBytes());
 
       // Update stats
       setState(() {
         totalCaptures++;
-        if (isLooking) {
-          lookingCaptures++;
-        } else {
-          notLookingCaptures++;
-        }
       });
 
       await _saveSettings();
 
       // Show notification
-      _showNotification(
-          'Photo Captured',
-          isLooking
-              ? 'You were looking at camera'
-              : 'You were not looking at camera');
+      _showNotification('Photo Captured', 'New photo captured');
 
       // Schedule next capture
       _scheduleNextCapture();
@@ -293,17 +530,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  void _stopRandomCapture() {
+  void _stopRandomCapture() async {
     captureTimer?.cancel();
     setState(() {
       isActive = false;
     });
+
+    // Update preferences
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('isActive', false);
+
+    // Cancel any pending background tasks
+    await Workmanager().cancelAll();
+
     _showNotification('Random Camera', 'Stopped capturing photos');
   }
 
   void _showMessage(String message) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
+      SnackBar(content: Text(message), duration: Durations.short1),
     );
   }
 
@@ -312,7 +558,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     controller?.dispose();
     captureTimer?.cancel();
-    faceDetector.close();
     super.dispose();
   }
 
@@ -321,7 +566,32 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     // Handle app lifecycle changes
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
+      // App is going to background or being killed
       captureTimer?.cancel();
+
+      // Schedule background task if session is active
+      if (isActive) {
+        // Get time remaining for the session
+        final endTime =
+            DateTime.now().millisecondsSinceEpoch + (duration * 60 * 1000);
+        final Map<String, dynamic> inputData = {
+          'isFrontCamera': isFrontCamera,
+          'endTime': endTime,
+        };
+
+        // Schedule background task to continue capturing
+        Workmanager().registerOneOffTask(
+          "random_capture_lifecycle_${DateTime.now().millisecondsSinceEpoch}",
+          kTaskCaptureRandom,
+          initialDelay: Duration(seconds: minDelay),
+          inputData: inputData,
+        );
+      }
+    } else if (state == AppLifecycleState.resumed && isActive) {
+      // App returned to foreground
+      // Cancel background tasks and resume foreground operation
+      Workmanager().cancelAll();
+      _scheduleNextCapture();
     }
   }
 
@@ -331,6 +601,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('Random Camera'),
         centerTitle: true,
+        actions: [
+          // Toggle camera button
+          IconButton(
+            icon: Icon(isFrontCamera ? Icons.camera_front : Icons.camera_rear),
+            onPressed: isActive
+                ? null
+                : () async {
+                    setState(() {
+                      isFrontCamera = !isFrontCamera;
+                    });
+                    await _saveSettings();
+                    await _initializeCamera();
+                  },
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         child: Padding(
@@ -340,18 +625,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             children: [
               // Preview
               if (isInitialized && controller != null)
-                AspectRatio(
-                  aspectRatio: controller!.value.aspectRatio,
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(16),
-                    child: CameraPreview(controller!),
-                  ),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: CameraPreview(controller!),
                 )
               else
                 const AspectRatio(
                   aspectRatio: 3 / 4,
                   child: Center(
                     child: CircularProgressIndicator(),
+                  ),
+                ),
+
+              const SizedBox(height: 20),
+
+              // Session status
+              if (isActive)
+                Card(
+                  color: Colors.green.shade100,
+                  child: Padding(
+                    padding: const EdgeInsets.all(12.0),
+                    child: Row(
+                      children: [
+                        Icon(Icons.circle, color: Colors.green, size: 16),
+                        SizedBox(width: 8),
+                        Text(
+                          'Capture session active',
+                          style: TextStyle(
+                              fontWeight: FontWeight.bold, color: Colors.black),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
 
@@ -375,8 +679,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                     child: Slider(
                       value: minDelay.toDouble(),
                       min: 5,
-                      max: 120,
-                      divisions: 23,
+                      max: 60,
+                      divisions: 11,
                       label: '$minDelay seconds',
                       onChanged: isActive
                           ? null
@@ -401,9 +705,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   Expanded(
                     child: Slider(
                       value: maxDelay.toDouble(),
-                      min: 30,
-                      max: 600,
-                      divisions: 19,
+                      min: 10,
+                      max: 120,
+                      divisions: 11,
                       label: '$maxDelay seconds',
                       onChanged: isActive
                           ? null
@@ -503,15 +807,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                       ),
                       const SizedBox(height: 10),
                       Text('Total captures: $totalCaptures'),
-                      Text('Looking at camera: $lookingCaptures'),
-                      Text('Not looking at camera: $notLookingCaptures'),
                       const SizedBox(height: 10),
                       TextButton.icon(
                         onPressed: () {
                           setState(() {
                             totalCaptures = 0;
-                            lookingCaptures = 0;
-                            notLookingCaptures = 0;
                           });
                           _saveSettings();
                         },
@@ -540,7 +840,6 @@ class GalleryPage extends StatefulWidget {
 class _GalleryPageState extends State<GalleryPage> {
   List<FileSystemEntity> _capturedImages = [];
   bool _isLoading = true;
-  String? _selectedFilter;
 
   @override
   void initState() {
@@ -567,13 +866,6 @@ class _GalleryPageState extends State<GalleryPage> {
       List<FileSystemEntity> files = dir.listSync();
       files.sort((a, b) => b.path.compareTo(a.path)); // Sort by newest
 
-      // Filter if needed
-      if (_selectedFilter != null) {
-        files = files.where((file) {
-          return file.path.contains(_selectedFilter!);
-        }).toList();
-      }
-
       setState(() {
         _capturedImages = files;
         _isLoading = false;
@@ -591,30 +883,6 @@ class _GalleryPageState extends State<GalleryPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Captured Images'),
-        actions: [
-          PopupMenuButton<String>(
-            onSelected: (value) {
-              setState(() {
-                _selectedFilter = value == 'all' ? null : value;
-              });
-              _loadCapturedImages();
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(
-                value: 'all',
-                child: Text('All Images'),
-              ),
-              const PopupMenuItem(
-                value: 'looking',
-                child: Text('Looking at Camera'),
-              ),
-              const PopupMenuItem(
-                value: 'not_looking',
-                child: Text('Not Looking at Camera'),
-              ),
-            ],
-          )
-        ],
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
@@ -630,7 +898,6 @@ class _GalleryPageState extends State<GalleryPage> {
                   itemCount: _capturedImages.length,
                   itemBuilder: (context, index) {
                     final file = _capturedImages[index];
-                    final isLooking = file.path.contains('looking_');
 
                     return GestureDetector(
                       onTap: () {
@@ -639,38 +906,15 @@ class _GalleryPageState extends State<GalleryPage> {
                           MaterialPageRoute(
                             builder: (context) => FullImageView(
                               imagePath: file.path,
-                              isLooking: isLooking,
                             ),
                           ),
                         );
                       },
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8),
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            Image.file(
-                              File(file.path),
-                              fit: BoxFit.cover,
-                            ),
-                            Positioned(
-                              bottom: 0,
-                              left: 0,
-                              right: 0,
-                              child: Container(
-                                color: Colors.black.withOpacity(0.5),
-                                padding: const EdgeInsets.all(4),
-                                child: Text(
-                                  isLooking ? 'Looking' : 'Not Looking',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                  textAlign: TextAlign.center,
-                                ),
-                              ),
-                            ),
-                          ],
+                        child: Image.file(
+                          File(file.path),
+                          fit: BoxFit.contain,
                         ),
                       ),
                     );
@@ -682,12 +926,10 @@ class _GalleryPageState extends State<GalleryPage> {
 
 class FullImageView extends StatelessWidget {
   final String imagePath;
-  final bool isLooking;
 
   const FullImageView({
     super.key,
     required this.imagePath,
-    required this.isLooking,
   });
 
   @override
@@ -701,7 +943,7 @@ class FullImageView extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(isLooking ? 'Looking at Camera' : 'Not Looking at Camera'),
+        title: const Text('Captured Image'),
         actions: [
           IconButton(
             icon: const Icon(Icons.delete),
@@ -737,27 +979,11 @@ class FullImageView extends StatelessWidget {
           Container(
             color: Colors.black87,
             padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  isLooking
-                      ? 'You were looking at the camera'
-                      : 'You were not looking at the camera',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Captured on: $formattedDate',
-                  style: const TextStyle(
-                    color: Colors.white70,
-                  ),
-                ),
-              ],
+            child: Text(
+              'Captured on: $formattedDate',
+              style: const TextStyle(
+                color: Colors.white70,
+              ),
             ),
           ),
         ],
