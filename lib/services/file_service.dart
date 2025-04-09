@@ -56,12 +56,6 @@ class FileServiceImpl implements FileService {
     List<XFile> xfiles =
         files.where((f) => f.existsSync()).map((f) => XFile(f.path)).toList();
 
-    print("all files");
-    print('files:');
-    for (final f in xfiles) {
-      print('${f.name}.${f.mimeType}');
-    }
-
     return xfiles;
   }
 

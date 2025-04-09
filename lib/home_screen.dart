@@ -4,14 +4,14 @@ import 'dart:math';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_camera_capture_test/gallery_screen.dart';
-import 'package:flutter_camera_capture_test/services/background_service.dart';
 import 'package:flutter_camera_capture_test/services/camera_service.dart';
 import 'package:flutter_camera_capture_test/services/file_service.dart';
+import 'package:flutter_camera_capture_test/services/foreground_camera_service.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:workmanager/workmanager.dart';
 
 class HomePage extends ConsumerStatefulWidget {
   const HomePage({super.key});
@@ -45,11 +45,33 @@ class _HomePageState extends ConsumerState<HomePage>
   final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
       FlutterLocalNotificationsPlugin();
 
+  void _onReceiveTaskData(Object data) {
+    print("✨✨ received data from task handler in foreground service!");
+
+    if (data is Map<String, dynamic>) {
+      final dynamic timestampMillis = data["timestampMillis"];
+      if (timestampMillis != null) {
+        final DateTime timestamp =
+            DateTime.fromMillisecondsSinceEpoch(timestampMillis, isUtc: true);
+        print('timestamp: ${timestamp.toString()}');
+      }
+    }
+
+    print("📸📸 scheduling next capture");
+    _captureImage();
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initializeApp();
+    // Add a callback to receive data sent from the TaskHandler.
+    FlutterForegroundTask.addTaskDataCallback(_onReceiveTaskData);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await CameraForegroundService.initForegroundTask();
+    });
   }
 
   Future<void> _initializeApp() async {
@@ -210,21 +232,6 @@ class _HomePageState extends ConsumerState<HomePage>
     // Schedule first capture in foreground
     _scheduleNextCapture();
 
-    // Register background task for when app is killed
-    // This ensures at least one capture happens if app is closed
-    // TODO when to need input data
-    // final Map<String, dynamic> inputData = {
-    //   'isFrontCamera': isFrontCamera,
-    //   'started': DateTime.now().millisecondsSinceEpoch,
-    // };
-
-    // await Workmanager().registerOneOffTask(
-    //   "random_capture_first",
-    //   kTaskCaptureRandom,
-    //   initialDelay: Duration(seconds: minDelay),
-    //   existingWorkPolicy: ExistingWorkPolicy.replace,
-    // );
-
     // Set end timer
     Timer(Duration(minutes: duration), () {
       _stopRandomCapture();
@@ -282,6 +289,8 @@ class _HomePageState extends ConsumerState<HomePage>
   }
 
   void _stopRandomCapture() async {
+    await CameraForegroundService.stopForegroundService();
+
     captureTimer?.cancel();
     setState(() {
       isActive = false;
@@ -290,10 +299,6 @@ class _HomePageState extends ConsumerState<HomePage>
     // Update preferences
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('isActive', false);
-
-    // Cancel any pending background tasks
-
-    await Workmanager().cancelAll();
 
     _showNotification('Random Camera', 'Stopped capturing photos');
   }
@@ -310,6 +315,8 @@ class _HomePageState extends ConsumerState<HomePage>
     WidgetsBinding.instance.removeObserver(this);
     controller?.dispose();
     captureTimer?.cancel();
+    // Remove a callback to receive data sent from the TaskHandler.
+    FlutterForegroundTask.removeTaskDataCallback(_onReceiveTaskData);
     super.dispose();
   }
 
@@ -330,19 +337,11 @@ class _HomePageState extends ConsumerState<HomePage>
           'isFrontCamera': isFrontCamera,
           'endTime': endTime,
         };
-
-        // Schedule background task to continue capturing
-        Workmanager().registerOneOffTask(
-          "random_capture_lifecycle_${DateTime.now().millisecondsSinceEpoch}",
-          kTaskCaptureRandom,
-          initialDelay: Duration(seconds: minDelay),
-          inputData: inputData,
-        );
       }
     } else if (state == AppLifecycleState.resumed && isActive) {
       // App returned to foreground
       // Cancel background tasks and resume foreground operation
-      Workmanager().cancelAll();
+
       _scheduleNextCapture();
     }
   }

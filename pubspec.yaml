@@ -45,6 +45,7 @@ dependencies:
   riverpod: ^2.6.1
   flutter_riverpod: ^2.6.1
   file_picker: ^10.0.0
+  flutter_foreground_task: ^8.17.0
 
 dev_dependencies:
   flutter_test:
